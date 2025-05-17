@@ -71,7 +71,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Запуск бота"""
-    app = ApplicationBuilder().token("YOUR_TELEGRAM_TOKEN").build()
+    app = ApplicationBuilder().token("7865332518:AAGeQppEvQeI0cvM8-QAlE1MXc0_voRUjIg").build()
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wallets))
