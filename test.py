@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 # Загрузка переменных окружения
 load_dotenv()
-TOKEN = os.getenv("7865332518:AAGeQppEvQeI0cvM8-QAlE1MXc0_voRUjIg")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # Возможные причины и источники
 REASONS = [
