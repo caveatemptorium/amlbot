@@ -1,5 +1,6 @@
 import logging
 import os
+import json
 import asyncio
 import aiohttp
 from datetime import datetime
@@ -13,61 +14,59 @@ from telegram.ext import (
 )
 from dotenv import load_dotenv
 
-# Загрузка переменных окружения
+# Загрузка конфигурации
 load_dotenv()
 
-# Проверка переменных
+# Проверка обязательных переменных
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
+BLOCKED_FILE = "blocked_addresses.json"
 
 if not TOKEN or not ETHERSCAN_API_KEY:
-    print("ОШИБКА: Создайте файл .env с переменными TELEGRAM_TOKEN и ETHERSCAN_API_KEY")
-    exit(1)
+    raise ValueError("Необходимо установить TELEGRAM_TOKEN и ETHERSCAN_API_KEY в .env")
 
-# Логирование
+# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-class BlockedAddressChecker:
-    # Актуальный список известных заблокированных адресов
-    KNOWN_BLOCKED = {
-        "0x8576acc5c05d6ce88f4e49bf65bdf0c62f91353c": "Фишинг",
-        "0x1da5821544e25c636c1417ba96ade4cf6d2f9b5a": "Взлом",
-        "0x9f4cda013e354b8fc285bf4b9a60460cee7f7ea9": "Отмывание денег"
-    }
+class BlocklistManager:
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.blocked_addresses = {}
+        self.load_blocklist()
+    
+    def load_blocklist(self):
+        """Загрузка списка заблокированных адресов из файла"""
+        try:
+            with open(self.file_path, 'r') as f:
+                self.blocked_addresses = json.load(f)
+            logger.info(f"Загружено {len(self.blocked_addresses)} заблокированных адресов")
+        except FileNotFoundError:
+            logger.warning("Файл с заблокированными адресами не найден, создан новый")
+            self.blocked_addresses = {}
+        except json.JSONDecodeError:
+            logger.error("Ошибка чтения JSON файла")
+            self.blocked_addresses = {}
+    
+    def is_blocked(self, address):
+        """Проверка адреса в чёрном списке"""
+        return self.blocked_addresses.get(address.lower())
 
-    @staticmethod
-    async def is_blocked(address: str) -> dict:
-        """Проверка адреса на блокировку"""
-        address_lower = address.lower()
-        
-        # 1. Проверка по локальному списку
-        if address_lower in BlockedAddressChecker.KNOWN_BLOCKED:
-            return {
-                'blocked': True,
-                'reason': BlockedAddressChecker.KNOWN_BLOCKED[address_lower],
-                'source': 'Локальная база'
-            }
-        
-        # 2. Проверка через API токенов (косвенный метод)
-        async with aiohttp.ClientSession() as session:
-            url = f"https://api.etherscan.io/api?module=account&action=tokentx&address={address}&apikey={ETHERSCAN_API_KEY}"
-            try:
-                async with session.get(url) as resp:
-                    data = await resp.json()
-                    if data.get('message') == 'NOTOK' and 'blocked' in str(data.get('result', '')).lower():
-                        return {
-                            'blocked': True,
-                            'reason': 'Заблокирован для токенов',
-                            'source': 'Etherscan API'
-                        }
-            except Exception as e:
-                logger.error(f"Blocked check error: {str(e)}")
-        
-        return {'blocked': False}
+    def add_to_blocklist(self, address, reason, source):
+        """Добавление адреса в чёрный список"""
+        self.blocked_addresses[address.lower()] = {
+            "reason": reason,
+            "source": source
+        }
+        self.save_blocklist()
+    
+    def save_blocklist(self):
+        """Сохранение списка в файл"""
+        with open(self.file_path, 'w') as f:
+            json.dump(self.blocked_addresses, f, indent=2)
 
 class EtherscanAPI:
     @staticmethod
@@ -97,75 +96,125 @@ class EtherscanAPI:
             logger.error(f"Contract check error: {str(e)}")
         return False
 
-async def analyze_address(address: str) -> dict:
+async def analyze_address(address: str, blocklist: BlocklistManager) -> dict:
     """Полный анализ адреса"""
-    balance, is_blocked, is_contract = await asyncio.gather(
+    address_lower = address.lower()
+    
+    # Проверка в чёрном списке
+    blocked_info = blocklist.is_blocked(address_lower)
+    
+    # Параллельные запросы к Etherscan
+    balance, is_contract = await asyncio.gather(
         EtherscanAPI.get_balance(address),
-        BlockedAddressChecker.is_blocked(address),
         EtherscanAPI.is_contract(address)
     )
+    
     return {
         'address': address,
         'balance': balance,
-        'is_blocked': is_blocked,
         'is_contract': is_contract,
+        'blocked': blocked_info if blocked_info else None,
         'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
 def format_report(data: dict) -> str:
-    """Форматирование отчета"""
+    """Форматирование отчёта"""
     report = [
         f"🔍 <b>Анализ адреса</b> <code>{data['address']}</code>",
         f"💰 <b>Баланс:</b> {data['balance']:.6f} ETH",
-        f"📜 <b>Тип:</b> {'Контракт' if data['is_contract'] else 'Кошелек'}"
+        f"📜 <b>Тип:</b> {'Контракт' if data['is_contract'] else 'Кошелёк'}"
     ]
     
-    if data['is_blocked']['blocked']:
+    if data['blocked']:
         report.append(
-            f"🚨 <b>ВНИМАНИЕ: АДРЕС ЗАБЛОКИРОВАН!</b>\n"
-            f"• Причина: {data['is_blocked']['reason']}\n"
-            f"• Источник: {data['is_blocked']['source']}\n\n"
-            f"⚠️ <i>Рекомендуется прекратить любые операции с этим адресом</i>"
+            f"🚨 <b>ВНИМАНИЕ: Адрес в чёрном списке!</b>\n"
+            f"• Причина: {data['blocked']['reason']}\n"
+            f"• Источник: {data['blocked']['source']}"
         )
     else:
         report.append("✅ <b>Адрес не найден в чёрных списках</b>")
     
-    report.append(f"\n<i>Обновлено: {data['timestamp']}</i>")
+    report.append(f"<i>Обновлено: {data['timestamp']}</i>")
     
     return "\n\n".join(report)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
     await update.message.reply_text(
-        "🛡️ <b>Анализатор ETH кошельков</b>\n\n"
-        "Отправьте ETH адрес (0x...) для проверки:\n"
+        "🛡️ <b>ETH Address Analyzer</b>\n\n"
+        "Отправьте ETH адрес для проверки:\n"
         "- Баланс ETH\n"
-        "- Наличие в чёрных списках\n"
+        "- Наличие в чёрном списке\n"
         "- Тип адреса\n\n"
         "Пример: <code>0x742d35Cc6634C0532925a3b844Bc454e4438f44e</code>",
         parse_mode="HTML"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик сообщений с адресами"""
     address = update.message.text.strip()
     
     if not (address.startswith('0x') and len(address) == 42):
-        await update.message.reply_text("❌ Неверный формат адреса! Должен начинаться с 0x и содержать 42 символа")
+        await update.message.reply_text(
+            "❌ Неверный формат адреса! Должен начинаться с 0x и содержать 42 символа",
+            parse_mode="HTML"
+        )
+        return
+    
+    blocklist = context.bot_data.get('blocklist')
+    if not blocklist:
+        await update.message.reply_text("⚠️ Ошибка загрузки чёрного списка")
         return
     
     msg = await update.message.reply_text("🔍 Проверяю адрес...")
     
     try:
-        analysis = await analyze_address(address)
+        analysis = await analyze_address(address, blocklist)
         await msg.edit_text(format_report(analysis), parse_mode="HTML")
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
-        await msg.edit_text("⚠️ Ошибка при проверке адреса. Попробуйте позже.")
+        logger.error(f"Analysis error: {str(e)}")
+        await msg.edit_text("⚠️ Ошибка при анализе адреса")
+
+async def add_blocked_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для добавления адреса в чёрный список (/block <address> <reason>)"""
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Использование: /block <адрес> <причина> [источник]")
+        return
+    
+    address = context.args[0]
+    reason = context.args[1]
+    source = context.args[2] if len(context.args) > 2 else "Ручное добавление"
+    
+    blocklist = context.bot_data.get('blocklist')
+    if not blocklist:
+        await update.message.reply_text("⚠️ Ошибка доступа к чёрному списку")
+        return
+    
+    blocklist.add_to_blocklist(address, reason, source)
+    await update.message.reply_text(
+        f"✅ Адрес {address} добавлен в чёрный список\n"
+        f"Причина: {reason}\n"
+        f"Источник: {source}"
+    )
+
+async def post_init(application):
+    """Инициализация после запуска бота"""
+    blocklist = BlocklistManager(BLOCKED_FILE)
+    application.bot_data['blocklist'] = blocklist
+    logger.info("Бот инициализирован")
 
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    """Запуск бота"""
+    app = ApplicationBuilder() \
+        .token(TOKEN) \
+        .post_init(post_init) \
+        .build()
+    
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("block", add_blocked_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("Бот запущен")
+    
+    logger.info("Бот запущен и готов к работе")
     app.run_polling()
 
 if __name__ == "__main__":
