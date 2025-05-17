@@ -1,4 +1,5 @@
 import logging
+import os
 import asyncio
 from telegram import Update
 from telegram.ext import (
@@ -10,13 +11,10 @@ from telegram.ext import (
 )
 from gql import gql, Client
 from gql.transport.aiohttp import AIOHTTPTransport
-import os
 from dotenv import load_dotenv
 
-# Загрузка конфигурации
-load_dotenv()
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-BITQUERY_KEY = os.getenv("BITQUERY_API_KEY")
+# Фикс для RUVDS: отключаем проверку прокси для Telegram
+os.environ['NO_PROXY'] = 'api.telegram.org,graphql.bitquery.io'
 
 # Настройка логов
 logging.basicConfig(
@@ -26,89 +24,112 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Загрузка конфигурации
+load_dotenv()
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+BITQUERY_KEY = os.getenv("BITQUERY_API_KEY")
 
-async def analyze_address(address: str) -> dict:
-    """Запрос к Bitquery API"""
+async def analyze_address(address: str) -> str:
+    """Безопасный запрос к Bitquery с обработкой ошибок"""
     transport = AIOHTTPTransport(
         url="https://graphql.bitquery.io",
         headers={"X-API-KEY": BITQUERY_KEY},
         timeout=30
     )
-
-    query = gql("""
-        query AnalyzeAddress($address: String!) {
-          ethereum {
-            address(address: {is: $address}) {
-              smartContract { 
-                contractType 
-              }
-              annotations
-              balance
-            }
-          }
-        }
-    """)
-
+    
     try:
         async with Client(
-                transport=transport,
-                execute_timeout=45,
-                fetch_schema_from_transport=False
+            transport=transport,
+            execute_timeout=45,
+            fetch_schema_from_transport=False
         ) as session:
+            query = gql("""
+                query AnalyzeAddress($address: String!) {
+                  ethereum {
+                    address(address: {is: $address}) {
+                      annotations
+                      smartContract { contractType }
+                    }
+                  }
+                }
+            """)
             result = await session.execute(query, variable_values={"address": address})
-            return result["ethereum"]["address"][0]
+            data = result["ethereum"]["address"][0]
+            
+            if not data:
+                return "🔍 Адрес не найден"
+                
+            risks = []
+            if data["annotations"]:
+                risks.extend(data["annotations"])
+            if data["smartContract"]:
+                risks.append(f"Контракт ({data['smartContract']['contractType']})")
+                
+            return "⚠️ Риски: " + ", ".join(risks) if risks else "✅ Адрес чист"
+            
     except Exception as e:
         logger.error(f"Bitquery error: {str(e)[:200]}")
-        return None
-
+        return "⛔ Ошибка проверки. Попробуйте позже."
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🛡️ AML Bot (Bitquery)\n\n"
-        "Отправьте ETH/BSC адрес для проверки\n"
-        "Пример: 0x1f9090aaE28b8a3dCeaDf281B0F12828e676c326"
-    )
-
+    """Обработчик команды /start"""
+    try:
+        await update.message.reply_text(
+            "🛡️ AML Bot для проверки криптоадресов\n\n"
+            "Отправьте ETH/BSC адрес для анализа\n"
+            "Пример: 0x1f9090aaE28b8a3dCeaDf281B0F12828e676c326"
+        )
+    except Exception as e:
+        logger.error(f"Start error: {e}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    address = update.message.text.strip()
-
-    if not (address.startswith("0x") and len(address) == 42):
-        await update.message.reply_text("❌ Неверный формат адреса")
-        return
-
-    msg = await update.message.reply_text("🔍 Запрос к Bitquery...")
-
-    data = await analyze_address(address)
-    if not data:
-        await msg.edit_text("⛔ Ошибка подключения к Bitquery")
-        return
-
-    response = []
-    if data["smartContract"]:
-        response.append(f"📄 Контракт: {data['smartContract']['contractType']}")
-    if data["annotations"]:
-        response.append(f"⚠️ Риски: {', '.join(data['annotations'])}")
-
-    await msg.edit_text("\n".join(response) if response else "✅ Адрес чист")
-
+    """Безопасная обработка сообщений"""
+    try:
+        address = update.message.text.strip()
+        
+        if not (address.startswith("0x") and len(address) == 42):
+            await update.message.reply_text("❌ Неверный формат адреса")
+            return
+        
+        msg = await update.message.reply_text("🔍 Проверяю адрес...")
+        result = await analyze_address(address)
+        await msg.edit_text(result)
+        
+    except Exception as e:
+        logger.error(f"Message error: {e}")
+        await update.message.reply_text("⛔ Ошибка обработки запроса")
 
 def main():
-    app = ApplicationBuilder() \
-        .token(TOKEN) \
-        .http_version("1.1") \
-        .get_updates_http_version("1.1") \
-        .build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    app.run_polling(
-        poll_interval=1.0,
-        timeout=10,
-        drop_pending_updates=True
-    )
-
+    """Точка входа с обработкой исключений"""
+    try:
+        logger.info("Starting bot...")
+        
+        # Фикс для RUVDS: настройка keepalive
+        application = ApplicationBuilder() \
+            .token(TOKEN) \
+            .http_version("1.1") \
+            .get_updates_http_version("1.1") \
+            .pool_timeout(30) \
+            .connect_timeout(30) \
+            .build()
+        
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_message
+        ))
+        
+        application.run_polling(
+            poll_interval=1.0,
+            timeout=30,
+            drop_pending_updates=True
+        )
+        
+    except Exception as e:
+        logger.critical(f"Fatal error: {e}")
+        raise
 
 if __name__ == "__main__":
+    # Фикс для asyncio на RUVDS
+    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
     main()
