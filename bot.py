@@ -25,153 +25,183 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class RiskAnalyzer:
+class AddressValidator:
     @staticmethod
-    async def check_address_risk(address: str) -> dict:
-        """Проверка адреса на блокировку через Etherscan API"""
+    def is_valid_eth_address(address: str) -> bool:
+        """Проверка валидности ETH адреса"""
+        if not isinstance(address, str):
+            return False
+        if not address.startswith('0x'):
+            return False
+        if len(address) != 42:
+            return False
         try:
-            # Проверка через API транзакций
+            int(address, 16)
+            return True
+        except ValueError:
+            return False
+
+class RiskAnalyzer:
+    BLACKLIST = {
+        "0x8576acc5c05d6ce88f4e49bf65bdf0c62f91353c": "Фишинг",
+        "0x1da5821544e25c636c1417ba96ade4cf6d2f9b5a": "Отмывание денег",
+        "0xae2fc483527b8ef99eb5d9b44875f005ba1fae13": "Взлом"
+    }
+
+    @staticmethod
+    async def check_risk(address: str) -> dict:
+        """Проверка адреса на рискованность"""
+        address_lower = address.lower()
+        if address_lower in RiskAnalyzer.BLACKLIST:
+            return {
+                "risk": True,
+                "reason": RiskAnalyzer.BLACKLIST[address_lower],
+                "source": "Локальный чёрный список"
+            }
+        
+        # Проверка через Etherscan API
+        try:
             url = f"https://api.etherscan.io/api?module=account&action=txlist&address={address}&startblock=0&endblock=99999999&page=1&offset=1&sort=asc&apikey={ETHERSCAN_API_KEY}"
-            
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as resp:
                     data = await resp.json()
-                    
-                    # Косвенные признаки блокировки
-                    if data.get("message") == "NOTOK" and "blocked" in data.get("result", "").lower():
+                    if data.get('message') == 'NOTOK' and 'blocked' in str(data.get('result', '')).lower():
                         return {
                             "risk": True,
-                            "reason": "Заблокирован (Etherscan API)",
-                            "source": "Etherscan Transaction API"
+                            "reason": "Заблокирован Etherscan",
+                            "source": "Etherscan API"
                         }
-                
-                # Дополнительная проверка через API токенов
-                token_url = f"https://api.etherscan.io/api?module=account&action=tokentx&address={address}&startblock=0&endblock=99999999&sort=asc&apikey={ETHERSCAN_API_KEY}"
-                async with session.get(token_url) as token_resp:
-                    token_data = await token_resp.json()
-                    if token_data.get("message") == "NOTOK" and "blocked" in token_data.get("result", "").lower():
-                        return {
-                            "risk": True,
-                            "reason": "Заблокирован для токенов",
-                            "source": "Etherscan Token API"
-                        }
-            
-            return {"risk": False}
-            
         except Exception as e:
             logger.error(f"Risk check error: {str(e)}")
-            return {"risk": False, "error": str(e)}
+        
+        return {"risk": False}
 
-class AddressAnalyzer:
+class EtherscanClient:
     @staticmethod
-    async def get_transactions(address: str) -> list:
-        url = f"https://api.etherscan.io/api?module=account&action=txlist&address={address}&startblock=0&endblock=99999999&sort=asc&apikey={ETHERSCAN_API_KEY}"
+    async def get_balance(address: str) -> float:
+        """Получение баланса ETH"""
+        url = f"https://api.etherscan.io/api?module=account&action=balance&address={address}&tag=latest&apikey={ETHERSCAN_API_KEY}"
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
                 data = await resp.json()
-                return data.get('result', []) if data.get('status') == '1' else []
+                if data.get('status') == '1':
+                    return int(data['result']) / 10**18
+                return 0.0
 
     @staticmethod
+    async def is_contract(address: str) -> bool:
+        """Проверка, является ли адрес контрактом"""
+        url = f"https://api.etherscan.io/api?module=contract&action=getabi&address={address}&apikey={ETHERSCAN_API_KEY}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                return data.get('status') == '1' and data['result'] != 'Contract source code not verified'
+
+    @staticmethod
+    async def get_transaction_count(address: str) -> int:
+        """Получение количества транзакций"""
+        url = f"https://api.etherscan.io/api?module=account&action=txlist&address={address}&startblock=0&endblock=99999999&page=1&offset=1&sort=asc&apikey={ETHERSCAN_API_KEY}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                return len(data.get('result', [])) if data.get('status') == '1' else 0
+
+class AddressAnalyzer:
+    @staticmethod
     async def analyze_address(address: str) -> dict:
-        try:
-            async with aiohttp.ClientSession() as session:
-                # Получаем баланс
-                balance_url = f"https://api.etherscan.io/api?module=account&action=balance&address={address}&tag=latest&apikey={ETHERSCAN_API_KEY}"
-                async with session.get(balance_url) as resp:
-                    data = await resp.json()
-                    balance = int(data['result']) / 10**18 if data.get('status') == '1' else 0
+        """Полный анализ адреса"""
+        if not AddressValidator.is_valid_eth_address(address):
+            raise ValueError("Invalid ETH address")
 
-                # Проверяем контракт
-                contract_url = f"https://api.etherscan.io/api?module=contract&action=getabi&address={address}&apikey={ETHERSCAN_API_KEY}"
-                async with session.get(contract_url) as resp:
-                    contract_data = await resp.json()
-                    is_contract = contract_data.get('status') == '1' and contract_data['result'] != 'Contract source code not verified'
+        balance = await EtherscanClient.get_balance(address)
+        is_contract = await EtherscanClient.is_contract(address)
+        tx_count = await EtherscanClient.get_transaction_count(address)
+        risk_info = await RiskAnalyzer.check_risk(address)
 
-                # Проверка рисков
-                risk_info = await RiskAnalyzer.check_address_risk(address)
-                
-                # Получаем транзакции
-                transactions = await AddressAnalyzer.get_transactions(address)
-                tx_count = len(transactions)
-                first_seen = datetime.fromtimestamp(int(transactions[0]['timeStamp'])) if tx_count > 0 else None
+        return {
+            'address': address,
+            'balance': balance,
+            'is_contract': is_contract,
+            'tx_count': tx_count,
+            'risk': risk_info,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
 
-                return {
-                    'address': address,
-                    'balance': balance,
-                    'is_contract': is_contract,
-                    'risk': risk_info,
-                    'tx_count': tx_count,
-                    'first_seen': first_seen,
-                    'transactions': transactions
-                }
+def format_report(analysis: dict) -> str:
+    """Форматирование отчета"""
+    risk_msg = (
+        f"🚨 <b>ВНИМАНИЕ: Риск обнаружен!</b>\n"
+        f"• Причина: {analysis['risk']['reason']}\n"
+        f"• Источник: {analysis['risk']['source']}"
+    ) if analysis['risk']['risk'] else "✅ <b>Риски не обнаружены</b>"
 
-        except Exception as e:
-            logger.error(f"Address analysis error: {str(e)}")
-            raise
+    return (
+        f"🔍 <b>Анализ адреса</b> <code>{analysis['address']}</code>\n\n"
+        f"💰 <b>Баланс:</b> {analysis['balance']:.6f} ETH\n"
+        f"📜 <b>Тип:</b> {'Контракт' if analysis['is_contract'] else 'Кошелёк'}\n"
+        f"📊 <b>Транзакций:</b> {analysis['tx_count']}\n\n"
+        f"{risk_msg}\n\n"
+        f"<i>Обновлено: {analysis['timestamp']}</i>"
+    )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🛡️ <b>Etherscan Address Analyzer</b>\n\n"
-        "Отправьте ETH-адрес (0x...) для проверки на блокировки\n"
-        "Пример: <code>0x000000000000000880620000000203571704007</code>",
+        "🛡️ <b>ETH Address Analyzer Bot</b>\n\n"
+        "Отправьте ETH-адрес (начинается с 0x, 42 символа) для проверки\n"
+        "Пример: <code>0x1f9090aaE28b8a3dCeaDf281B0F12828e676c326</code>",
         parse_mode="HTML"
     )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def analyze_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         address = update.message.text.strip()
-        if not (address.startswith("0x") and len(address) == 42):
-            await update.message.reply_text("❌ Неверный формат адреса! Должен начинаться с 0x и иметь 42 символа")
+        
+        if not AddressValidator.is_valid_eth_address(address):
+            await update.message.reply_text(
+                "❌ <b>Неверный формат адреса!</b>\n"
+                "ETH адрес должен:\n"
+                "- Начинаться с 0x\n"
+                "- Содержать ровно 42 символа\n"
+                "- Состоять из hex-символов (0-9, a-f)\n\n"
+                "Пример: <code>0x742d35Cc6634C0532925a3b844Bc454e4438f44e</code>",
+                parse_mode="HTML"
+            )
             return
 
         msg = await update.message.reply_text("🔍 Анализирую адрес...")
-        analysis = await AddressAnalyzer.analyze_address(address)
         
-        # Формируем отчет
-        report = (
-            f"🔍 <b>Анализ адреса</b> <code>{address}</code>\n\n"
-            f"💰 <b>Баланс:</b> {analysis['balance']:.4f} ETH\n"
-            f"📜 <b>Тип:</b> {'Контракт' if analysis['is_contract'] else 'Кошелёк'}\n"
-            f"📊 <b>Транзакций:</b> {analysis['tx_count']}\n"
-            f"📅 <b>Первая активность:</b> {analysis['first_seen'].strftime('%Y-%m-%d') if analysis['first_seen'] else 'Нет данных'}\n\n"
-        )
-        
-        # Добавляем информацию о блокировке
-        if analysis['risk']['risk']:
-            report += (
-                f"🚨 <b>ВНИМАНИЕ: Адрес заблокирован!</b>\n"
-                f"• Причина: {analysis['risk']['reason']}\n"
-                f"• Источник: {analysis['risk']['source']}\n\n"
-                f"⚠️ Возможные последствия:\n"
-                f"- Блокировка переводов стейблкоинов (USDT, USDC)\n"
-                f"- Отказ от обслуживания биржами\n"
+        try:
+            analysis = await AddressAnalyzer.analyze_address(address)
+            report = format_report(analysis)
+            await msg.edit_text(report, parse_mode="HTML")
+            
+        except Exception as e:
+            logger.error(f"Analysis error: {str(e)}")
+            await msg.edit_text(
+                "⚠️ <b>Ошибка анализа</b>\n"
+                "Не удалось получить данные. Возможные причины:\n"
+                "- Неправильный адрес\n"
+                "- Проблемы с API Etherscan\n"
+                "- Превышен лимит запросов",
+                parse_mode="HTML"
             )
-        else:
-            report += "✅ <b>Блокировки не обнаружены</b> (по данным Etherscan API)"
-        
-        await msg.edit_text(report, parse_mode="HTML")
-
+            
     except Exception as e:
-        logger.error(f"Message handling error: {str(e)}")
-        await update.message.reply_text("⚠️ Произошла ошибка при анализе адреса")
+        logger.error(f"Handler error: {str(e)}")
+        await update.message.reply_text("🚫 Внутренняя ошибка бота. Попробуйте позже.")
 
 def main():
     app = ApplicationBuilder() \
         .token(TOKEN) \
         .http_version("1.1") \
         .get_updates_http_version("1.1") \
-        .pool_timeout(30) \
         .build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, analyze_handler))
 
-    logger.info("Бот запускается...")
-    app.run_polling(
-        poll_interval=1.0,
-        timeout=30,
-        drop_pending_updates=True
-    )
+    logger.info("Бот запущен и готов к работе")
+    app.run_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
