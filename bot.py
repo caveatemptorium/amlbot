@@ -10,12 +10,16 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ContextTypes,
-    filters
+    filters,
+    ConversationHandler
 )
 from dotenv import load_dotenv
 
 # Загрузка конфигурации
 load_dotenv()
+
+# Константы для ConversationHandler
+ADD_ADDRESS, ADD_REASON, ADD_SOURCE = range(3)
 
 # Проверка обязательных переменных
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -55,7 +59,7 @@ class BlocklistManager:
         """Проверка адреса в чёрном списке"""
         return self.blocked_addresses.get(address.lower())
 
-    def add_to_blocklist(self, address, reason, source):
+    def add_to_blocklist(self, address, reason, source="Ручное добавление"):
         """Добавление адреса в чёрный список"""
         self.blocked_addresses[address.lower()] = {
             "reason": reason,
@@ -142,13 +146,91 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
     await update.message.reply_text(
         "🛡️ <b>ETH Address Analyzer</b>\n\n"
-        "Отправьте ETH адрес для проверки:\n"
-        "- Баланс ETH\n"
-        "- Наличие в чёрном списке\n"
-        "- Тип адреса\n\n"
-        "Пример: <code>0x742d35Cc6634C0532925a3b844Bc454e4438f44e</code>",
+        "Я могу:\n"
+        "1. Проверять ETH адреса на баланс и тип (кошелёк/контракт)\n"
+        "2. Проверять адреса по чёрному списку\n"
+        "3. Добавлять новые адреса в чёрный список\n\n"
+        "📌 <b>Как использовать:</b>\n"
+        "- Просто отправьте ETH адрес для проверки\n"
+        "- Используйте /block чтобы добавить подозрительный адрес\n\n"
+        "Пример адреса: <code>0x742d35Cc6634C0532925a3b844Bc454e4438f44e</code>",
         parse_mode="HTML"
     )
+
+async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало процесса добавления адреса"""
+    await update.message.reply_text(
+        "📝 <b>Добавление адреса в чёрный список</b>\n\n"
+        "Пожалуйста, отправьте ETH адрес который нужно добавить (начинается с 0x, 42 символа)\n\n"
+        "❌ Для отмены используйте /cancel",
+        parse_mode="HTML"
+    )
+    return ADD_ADDRESS
+
+async def add_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 1: Получение адреса"""
+    address = update.message.text.strip()
+    
+    if not (address.startswith('0x') and len(address) == 42):
+        await update.message.reply_text(
+            "❌ Неверный формат адреса! Должен начинаться с 0x и содержать 42 символа\n"
+            "Попробуйте ещё раз или /cancel для отмены"
+        )
+        return ADD_ADDRESS
+    
+    context.user_data['block_address'] = address
+    await update.message.reply_text(
+        "📝 Теперь укажите причину блокировки (например: 'Фишинг', 'Мошенничество')\n\n"
+        "❌ Для отмены используйте /cancel"
+    )
+    return ADD_REASON
+
+async def add_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 2: Получение причины"""
+    reason = update.message.text.strip()
+    context.user_data['block_reason'] = reason
+    await update.message.reply_text(
+        "📝 Укажите источник информации (например: 'Жалоба пользователя', 'Данные от CertiK')\n"
+        "Или просто отправьте '-' для значения по умолчанию\n\n"
+        "❌ Для отмены используйте /cancel"
+    )
+    return ADD_SOURCE
+
+async def add_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 3: Получение источника и сохранение"""
+    source = update.message.text.strip()
+    if source == '-':
+        source = "Ручное добавление"
+    
+    blocklist = context.bot_data.get('blocklist')
+    if not blocklist:
+        await update.message.reply_text("⚠️ Ошибка доступа к чёрному списку")
+        return ConversationHandler.END
+    
+    address = context.user_data['block_address']
+    reason = context.user_data['block_reason']
+    
+    blocklist.add_to_blocklist(address, reason, source)
+    
+    await update.message.reply_text(
+        f"✅ <b>Адрес добавлен в чёрный список</b>\n\n"
+        f"<code>{address}</code>\n"
+        f"Причина: {reason}\n"
+        f"Источник: {source}",
+        parse_mode="HTML"
+    )
+    
+    # Очистка временных данных
+    context.user_data.pop('block_address', None)
+    context.user_data.pop('block_reason', None)
+    
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена операции"""
+    await update.message.reply_text("❌ Добавление адреса отменено")
+    context.user_data.clear()
+    return ConversationHandler.END
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик сообщений с адресами"""
@@ -175,28 +257,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Analysis error: {str(e)}")
         await msg.edit_text("⚠️ Ошибка при анализе адреса")
 
-async def add_blocked_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для добавления адреса в чёрный список (/block <address> <reason>)"""
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text("Использование: /block <адрес> <причина> [источник]")
-        return
-    
-    address = context.args[0]
-    reason = context.args[1]
-    source = context.args[2] if len(context.args) > 2 else "Ручное добавление"
-    
-    blocklist = context.bot_data.get('blocklist')
-    if not blocklist:
-        await update.message.reply_text("⚠️ Ошибка доступа к чёрному списку")
-        return
-    
-    blocklist.add_to_blocklist(address, reason, source)
-    await update.message.reply_text(
-        f"✅ Адрес {address} добавлен в чёрный список\n"
-        f"Причина: {reason}\n"
-        f"Источник: {source}"
-    )
-
 async def post_init(application):
     """Инициализация после запуска бота"""
     blocklist = BlocklistManager(BLOCKED_FILE)
@@ -210,8 +270,19 @@ def main():
         .post_init(post_init) \
         .build()
     
+    # Обработчик команды /block с состояними
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('block', block_command)],
+        states={
+            ADD_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_address)],
+            ADD_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_reason)],
+            ADD_SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_source)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("block", add_blocked_command))
+    app.add_handler(conv_handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     logger.info("Бот запущен и готов к работе")
