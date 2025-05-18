@@ -15,7 +15,7 @@
 ## Установка
 1. `pip install -r requirements.txt`
 2. Создать .env файл
-2.1. `TELEGRAM_TOKEN=ваш_токен_из_телеграмма # Токен от @BotFather
+      TELEGRAM_TOKEN=ваш_токен_из_телеграмма # Токен от @BotFather
       ETHERSCAN_API_KEY=ваш_токен_из_etherscan  # Ключ Etherscan
-      SECRET_PHRASE=ваша_секретная_фраза #Секретная фраза для доступа в ЧС`
-6. Запустить `python bot.py`
+      SECRET_PHRASE=ваша_секретная_фраза #Секретная фраза для доступа в ЧС
+4. Запустить `python bot.py`
