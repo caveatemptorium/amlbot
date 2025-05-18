@@ -22,7 +22,7 @@ ENTER_PHRASE, CHOOSE_ACTION, ENTER_ADDRESS, ENTER_REASON, CONFIRM_REMOVE = range
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
-SECRET_PHRASE = os.getenv("SECRET_PHRASE", "мойсекрет123")
+SECRET_PHRASE = os.getenv("SECRET_PHRASE")
 BLACKLIST_FILE = "blacklist.json"
 
 # Логирование
